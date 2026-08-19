@@ -25,54 +25,141 @@ Take a factory-standard quickstart and produce a complete, ready-to-deploy RHDP 
    - What technologies it uses (models, frameworks, Intel hardware)
    - What a user would learn by building it step by step
 
-3. Run NovaScan and DarkScope in parallel:
+3. Run the capacity scan and security scan. All checks run inline — no external tools needed.
 
-```bash
-PYTHONPATH=~/Documents/novascan/src python3 -c "
-from novascan.scanner import scan_repo
-from novascan.planner import recommend_tier
-from pathlib import Path
-import json
+#### Capacity Scan
 
-results = scan_repo(Path('REPO_PATH').expanduser().resolve())
-plan = recommend_tier(results)
-print(json.dumps(plan, default=str))
-"
+Detect what the quickstart needs by grepping the source:
+
+**LLM framework detection** — grep for these imports/references:
+- `openai`, `langchain`, `llama_index`, `vllm`, `transformers`, `torch`, `openvino`, `optimum`
+- If found: the quickstart uses LLM inference
+
+**Model detection** — grep for model name patterns:
+- `granite`, `llama`, `qwen`, `mistral`, `phi`, `deepseek`, `falcon`, `gemma`, `nomic`
+- Check Containerfiles, compose files, values.yaml, and Python source
+- Note the model size (2B, 7B, 8B, 14B, 70B) — this determines resource needs
+
+**Local inference detection** — does the quickstart run a model LOCALLY (in the user's cluster) or call a remote API?
+- Local indicators: `vllm serve`, `--model` in container args, model download in Containerfile, `VLLM_CPU_KVCACHE_SPACE`, GPU resource requests
+- Remote/MaaS indicators: API URL environment variables (`MODEL_ENDPOINT`, `OPENAI_API_BASE`), no model downloads, no GPU requests
+
+**Infrastructure detection** — grep for:
+- Databases: `postgres`, `redis`, `mongodb`, `sqlite`, `pgvector`
+- Queues: `kafka`, `rabbitmq`, `celery`
+- Frontends: `gradio`, `streamlit`, `react`, `angular`, `vue`, `open-webui`
+- Helm charts: check `chart/` directory exists
+
+**Resource extraction** — read K8s manifests and Helm values for explicit CPU/memory requests.
+
+**Tier recommendation:**
+- **dedicated**: local model inference detected OR total CPU > 20 cores OR total memory > 32 GB
+- **partner**: uses LLM frameworks/models but via MaaS (no local inference)
+- **pilot**: no LLM usage detected — simple app, MaaS API key only
+
+**MaaS cluster sizing fix:** When the model runs on MaaS (not locally), the cluster only needs resources for the APPLICATION — frontend, backend, databases, embeddings. Do NOT size the cluster for model hosting. This was causing overprovisioning.
+
+| Scenario | Cluster size | Workers | Why |
+|---|---|---|---|
+| MaaS-only (no local model) | small | 2 | App + showroom only |
+| MaaS + embeddings (e.g., nomic) | small | 3 | App + embedding model pod |
+| Local CPU model (< 8B) | medium | 3-4 | Model needs ~16 GB RAM |
+| Local CPU model (>= 8B) | large | 4+ | Model needs 32+ GB RAM |
+| Local GPU model | dedicated | GPU nodes | Gaudi/CUDA required |
+
+**MaaS model selection** — match quickstart to the smallest model that works:
+
+| Use case | Start with | Upgrade to | Only if |
+|---|---|---|---|
+| Chat / Q&A / classification | granite-2b-cpu | granite-3-2-8b-instruct-cpu | Accuracy matters (RAG, compliance) |
+| Function calling / tool use | qwen3-14b | — | Only model with working FC |
+| RAG generation | granite-3-2-8b-instruct-cpu | qwen3-14b | Need FC in RAG agent mode |
+| Embeddings | nomic-embed-text-v1-5 | — | Standard choice |
+
+Known broken models (do not assign):
+- `granite-4-0-h-tiny-cpu` — 30s timeouts, no responses
+- `deepseek-r1-distill-qwen-14b` — function calling does not work despite being listed as FC-capable
+
+#### Security Scan
+
+Run these checks by grepping the repo (exclude `.git/`, `node_modules/`, `venv/`):
+
+**Secrets detection** (CRITICAL) — grep for:
+- AWS keys: `AKIA[0-9A-Z]{16}`
+- API keys: `sk-[A-Za-z0-9]{20,}`, `hf_[A-Za-z0-9]{20,}`, `ghp_[A-Za-z0-9]{20,}`
+- JWTs: `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`
+- Private keys: `-----BEGIN.*PRIVATE KEY-----`
+- Passwords in code: `password\s*[:=]\s*["'][A-Za-z0-9]`
+- Connection strings: `postgresql://.*:.*@`, `mongodb://.*:.*@`, `redis://.*:.*@`
+- High-value patterns: `api_key\s*[:=]\s*["'][A-Za-z0-9]`, `secret\s*[:=]\s*["'][A-Za-z0-9]`
+
+**Config issues** (HIGH) — check:
+- `.gitignore` exists and covers `.env`, `*.pem`, `*.key`, `__pycache__`, `venv/`
+- No `.env` files committed with real (non-placeholder) values
+- No secrets in YAML/JSON config files
+
+**Container security** (MEDIUM) — grep Containerfiles for:
+- `USER root` or no USER directive (runs as root)
+- `COPY .` (copies everything including secrets)
+- `:latest` tag on base images (unpinned)
+- `--privileged` in compose files
+- `--tls-verify=false` in scripts
+
+**Dangerous code patterns** (MEDIUM) — grep Python files for:
+- `eval(`, `exec(`, `__import__(`
+- `pickle.loads`, `yaml.load(` (without SafeLoader)
+- `subprocess.*shell=True`
+- `f"SELECT.*{` (SQL injection via f-string)
+
+**Infrastructure exposure** (HIGH) — grep for:
+- Internal RHDP hostnames: `sandbox.opentlc.com`, `infra.demo.redhat.com`, `redhatworkshops.io` hardcoded (not in attributes)
+- Private IPs: `10\.\d+\.\d+\.\d+`, `172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+`, `192\.168\.\d+\.\d+`
+
+**Supply chain** (LOW) — check pinned dependency versions against known CVEs:
+- `requests < 2.32.0` (CVE-2024-35195)
+- `flask < 2.3.0` (CVE-2023-30861)
+- `pyyaml < 6.0` (arbitrary code execution)
+- `cryptography < 41.0` (multiple CVEs)
+
+**Grading formula:**
+- Each finding has severity: critical (10 pts), high (7), medium (4), low (2), info (0)
+- Sum all points
+- Grade: <= 10 = A, <= 30 = B, <= 60 = C, <= 90 = D, > 90 = F
+- Blockers: grade D or F, any critical finding
+
+4. Present combined scan report:
+
 ```
+SCAN REPORT: <quickstart-name>
+==============================
+CAPACITY:
+  Tier: pilot / partner / dedicated
+  Model hosting: MaaS (shared) / Local (in-cluster)
+  Cluster size: small / medium / large
+  Workers: N
+  Estimated resources: X CPU, Y GB RAM per seat
+  MaaS model: <model-name>
 
-```bash
-PYTHONPATH=~/Documents/darkscope/src python3 -c "
-from darkscope.scanner import scan_repo
-from pathlib import Path
-import json
-
-results = scan_repo(Path('REPO_PATH').expanduser().resolve(), deep=True)
-print(json.dumps(results, default=str))
-"
+SECURITY: Grade [A-F]
+  Critical: N  High: N  Medium: N  Low: N
+  Blockers: [list or "none"]
 ```
-
-4. Present combined report:
-   - **Tier**: pilot / partner / dedicated with reasoning
-   - **Resources**: CPU, memory, storage per seat
-   - **Security Grade**: A-F with finding counts
-   - **Blockers**: grade D/F, critical findings, unsupported infra
-   - **MaaS Model**: recommended model from `~/Documents/intel-quickstarts-triforce/quickstart-to-showroom/templates/maas-model-map.yaml`
 
 5. Ask: "Continue to remediation? [Y/n]"
 
 ### Phase 2: CLASSIFY + REMEDIATE
 
-6. For each critical/high DarkScope finding, classify as:
-   - **auto_fixable**: clear code-level fix — propose edit
-   - **needs_human**: architectural issue — report only
-   - **false_positive**: test fixture / intentional — skip
+6. For each critical/high security finding, classify as:
+   - **auto_fixable**: clear code-level fix (hardcoded secret -> env var, missing .gitignore entry, unpinned image tag) — propose edit
+   - **needs_human**: architectural issue (running as root by design, SQL injection in core logic) — report only
+   - **false_positive**: test fixture, placeholder value, example in docs — skip with explanation
 
 7. For auto_fixable findings:
-   - Show finding: detector, title, file:line, CWE, recommendation
-   - Show proposed fix
+   - Show finding: check name, severity, file:line, what was found
+   - Show proposed fix using the Edit tool
    - Ask: "Apply fix? [Y/n/skip all]"
 
-8. If fixes applied, re-run DarkScope to verify grade improved.
+8. If fixes applied, re-run the security grep checks to verify grade improved. Report delta.
 
 ### Phase 3: AGNOSTICV CATALOG CONFIG
 
@@ -579,6 +666,10 @@ $ARGUMENTS - Path to quickstart repo or GitHub URL. Examples:
 - `/onboard https://github.com/rh-ai-quickstart/edge-ai-cpu-inference`
 - `/onboard .`
 
+## Dependencies
+
+None. All scanning, security checks, and content generation run inline. No external tools (NovaScan, DarkScope) or RHDP marketplace plugins required.
+
 ## Important Rules
 
 - **Labs are not deployment scripts.** Every module explains WHY before HOW. "See, Learn, Do" is mandatory, not optional.
@@ -588,3 +679,5 @@ $ARGUMENTS - Path to quickstart repo or GitHub URL. Examples:
 - **Progressive build.** Users construct the stack piece by piece and understand each layer before adding the next.
 - **Verify after every step.** Don't let users go 3 steps before finding out step 1 failed.
 - **Intel branding.** "Powered by Intel" only. No "Intel Gaudi" in user-facing content.
+- **MaaS = small cluster.** When the model runs on MaaS, size the cluster for the app only — not the model. This prevents overprovisioning.
+- **Smallest model that works.** Start with the smallest MaaS model that meets the use case. Don't default to qwen3-14b when granite-2b-cpu will do.
